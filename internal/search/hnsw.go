@@ -9,8 +9,10 @@
 package search
 
 import (
+	"cmp"
 	"math/rand"
 	"runtime"
+	"slices"
 	"sync"
 
 	"github.com/JosineyJr/rdb-26/internal/dataset"
@@ -34,8 +36,8 @@ type clusterBound struct {
 // each vector to the nearest centroid. It also reorganizes the vectors in memory
 // so that all vectors in a cluster are contiguous, maximizing CPU cache locality.
 func Build(vecs [][14]int8, labels []bool) *Index {
-	numClusters := 1024
-	nprobe := 16 // scan top 16 clusters (~1.5% of the dataset)
+	numClusters := 256
+	nprobe := 8 // scan top 8 clusters (~3.1% of the dataset)
 
 	if len(vecs) < numClusters {
 		numClusters = len(vecs)
@@ -55,9 +57,7 @@ func Build(vecs [][14]int8, labels []bool) *Index {
 		idx.centroids[i] = vecs[perm[i]]
 	}
 
-	// 2. Assign each vector to its nearest centroid ONCE (Random Partitioning).
-	// This naturally scatters the vectors slightly, which massively benefits
-	// the Early Abandon CPU branch prediction during query time!
+	// 2. Assign each vector to its nearest centroid.
 	workers := max(runtime.NumCPU(), 1)
 	stripe := (len(vecs) + workers - 1) / workers
 
@@ -198,7 +198,6 @@ func (idx *Index) KNN(query [14]float32, k int) []bool {
 	for j := range 14 {
 		qVal := int32(qInt[j])
 		for v := range 256 {
-			// v goes from 0 to 255. We cast it back to int8.
 			val := int32(int8(v))
 			d := qVal - val
 			distTable[j][v] = d * d
@@ -210,13 +209,8 @@ func (idx *Index) KNN(query [14]float32, k int) []bool {
 		dist int32
 	}
 
-	// 1. Calculate distances to all centroids and maintain top-16 directly
-	// This entirely bypasses slices.SortFunc, saving massive CPU cycles.
-	var top16 [16]centroidDist
-	for i := range 16 {
-		top16[i].dist = 0x7FFFFFFF
-	}
-
+	// 1. Calculate distances to all centroids using the memoized table.
+	var cDists [256]centroidDist
 	for c := 0; c < len(idx.centroids); c++ {
 		v := idx.centroids[c]
 		d := distTable[0][uint8(v[0])] + distTable[1][uint8(v[1])] +
@@ -226,32 +220,26 @@ func (idx *Index) KNN(query [14]float32, k int) []bool {
 			distTable[8][uint8(v[8])] + distTable[9][uint8(v[9])] +
 			distTable[10][uint8(v[10])] + distTable[11][uint8(v[11])] +
 			distTable[12][uint8(v[12])] + distTable[13][uint8(v[13])]
-
-		if d < top16[15].dist {
-			insertIdx := 15
-			for insertIdx > 0 && d < top16[insertIdx-1].dist {
-				insertIdx--
-			}
-			for k := 15; k > insertIdx; k-- {
-				top16[k] = top16[k-1]
-			}
-			top16[insertIdx] = centroidDist{id: c, dist: d}
-		}
+		cDists[c] = centroidDist{id: c, dist: d}
 	}
 
-	nprobe := 16
+	// 2. Sort the centroids to find the top `nprobe`.
+	slices.SortFunc(cDists[:], func(a, b centroidDist) int {
+		return cmp.Compare(a.dist, b.dist)
+	})
 
-	// 3. Scan clusters logic
+	nprobe := 8
+
+	// 3. Scan clusters — distTable lookups with Early Abandon
 	var t5 top5
-	maxDist := int32(0x7FFFFFFF) // Stays in a CPU register!
+	maxDist := int32(0x7FFFFFFF)
 
 	for i := range nprobe {
-		c := top16[i].id
+		c := cDists[i].id
 		bound := idx.clusters[c]
 		for j := bound.Start; j < bound.End; j++ {
 			v := idx.vecs[j]
 
-			// Unrolled with Early Abandon checks
 			d := distTable[0][uint8(v[0])] + distTable[1][uint8(v[1])] +
 				distTable[2][uint8(v[2])] + distTable[3][uint8(v[3])]
 			if d >= maxDist {
@@ -272,7 +260,6 @@ func (idx *Index) KNN(query [14]float32, k int) []bool {
 
 			d += distTable[12][uint8(v[12])] + distTable[13][uint8(v[13])]
 
-			// Final push
 			if d < maxDist {
 				t5.push(d, idx.labels[j])
 				if t5.count == 5 {
