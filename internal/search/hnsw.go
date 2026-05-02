@@ -10,6 +10,7 @@ package search
 
 import (
 	"cmp"
+	"math"
 	"math/rand"
 	"runtime"
 	"slices"
@@ -36,8 +37,8 @@ type clusterBound struct {
 // each vector to the nearest centroid. It also reorganizes the vectors in memory
 // so that all vectors in a cluster are contiguous, maximizing CPU cache locality.
 func Build(vecs [][14]int8, labels []bool) *Index {
-	numClusters := 256
-	nprobe := 8 // scan top 8 clusters (~3.1% of the dataset)
+	numClusters := 1024
+	nprobe := 8 // scan top 8 clusters (~0.8% of the dataset)
 
 	if len(vecs) < numClusters {
 		numClusters = len(vecs)
@@ -57,59 +58,123 @@ func Build(vecs [][14]int8, labels []bool) *Index {
 		idx.centroids[i] = vecs[perm[i]]
 	}
 
-	// 2. Assign each vector to its nearest centroid.
+	// 2. Spherical K-Means iterations (runs offline during Docker build).
 	workers := max(runtime.NumCPU(), 1)
 	stripe := (len(vecs) + workers - 1) / workers
 
 	type localClusters [][]int32
-	results := make([]localClusters, workers)
-	var wg sync.WaitGroup
+	var results []localClusters
 
-	for w := range workers {
-		start := w * stripe
-		end := min(start+stripe, len(vecs))
-		if start >= end {
-			continue
+	for iter := 0; iter < 5; iter++ {
+		results = make([]localClusters, workers)
+		var wg sync.WaitGroup
+
+		for w := range workers {
+			start := w * stripe
+			end := min(start+stripe, len(vecs))
+			if start >= end {
+				continue
+			}
+
+			wg.Add(1)
+			go func(w, start, end int) {
+				defer wg.Done()
+				lc := make([][]int32, numClusters)
+				for i := start; i < end; i++ {
+					v := vecs[i]
+					bestDist := int32(1<<31 - 1)
+					bestC := -1
+
+					for c := 0; c < numClusters; c++ {
+						d := euclidSq8(v, idx.centroids[c])
+						if d < bestDist {
+							bestDist = d
+							bestC = c
+						}
+					}
+					lc[bestC] = append(lc[bestC], int32(i))
+				}
+				results[w] = lc
+			}(w, start, end)
 		}
+		wg.Wait()
 
-		wg.Add(1)
-		go func(w, start, end int) {
-			defer wg.Done()
-			lc := make([][]int32, numClusters)
-			for i := start; i < end; i++ {
-				v := vecs[i]
-				bestDist := int32(1<<31 - 1)
-				bestC := -1
-
-				for c := 0; c < numClusters; c++ {
-					d := euclidSq8(v, idx.centroids[c])
-					if d < bestDist {
-						bestDist = d
-						bestC = c
+		if iter < 4 { // Recalculate centroids
+			for c := 0; c < numClusters; c++ {
+				var sums [14]int64
+				var count int64
+				for w := range workers {
+					if results[w] != nil {
+						for _, vi := range results[w][c] {
+							for d := 0; d < 14; d++ {
+								sums[d] += int64(vecs[vi][d])
+							}
+							count++
+						}
 					}
 				}
-				lc[bestC] = append(lc[bestC], int32(i))
+				if count > 0 {
+					var magSq int64
+					var means [14]float64
+					for d := 0; d < 14; d++ {
+						mean := float64(sums[d]) / float64(count)
+						means[d] = mean
+						magSq += int64(mean * mean)
+					}
+					
+					// Spherical Re-normalization: scale centroid back to magnitude ~127
+					// so it remains on the surface of the hyper-sphere.
+					if magSq > 0 {
+						mag := math.Sqrt(float64(magSq))
+						scale := 127.0 / mag
+						for d := 0; d < 14; d++ {
+							val := int(math.Round(means[d] * scale))
+							if val > 127 { val = 127 }
+							if val < -128 { val = -128 }
+							idx.centroids[c][d] = int8(val)
+						}
+					}
+				}
 			}
-			results[w] = lc
-		}(w, start, end)
+		}
 	}
-	wg.Wait()
 
-	// 3. Reorder vecs and labels to be contiguous by cluster (Cache Locality Optimization).
+	// 3. Reorder vecs and labels to be contiguous by cluster, sorted by distance to centroid.
+	// This is "The Golden Optimization": vectors near the centroid are evaluated first,
+	// dropping maxDist instantly and maximizing Early Abandon skips.
 	orderedVecs := make([][14]int8, len(vecs))
 	orderedLabels := make([]bool, len(labels))
 
 	var offset int32 = 0
+
+	type vecWithDist struct {
+		idx  int32
+		dist int32
+	}
+
 	for c := 0; c < numClusters; c++ {
 		startOffset := offset
+
+		var clusterVecs []vecWithDist
 		for w := range workers {
 			if results[w] != nil {
 				for _, vecIdx := range results[w][c] {
-					orderedVecs[offset] = vecs[vecIdx]
-					orderedLabels[offset] = labels[vecIdx]
-					offset++
+					clusterVecs = append(clusterVecs, vecWithDist{
+						idx:  vecIdx,
+						dist: euclidSq8(vecs[vecIdx], idx.centroids[c]),
+					})
 				}
 			}
+		}
+
+		slices.SortFunc(clusterVecs, func(a, b vecWithDist) int {
+			return cmp.Compare(a.dist, b.dist)
+		})
+
+		for _, vd := range clusterVecs {
+			orderedVecs[offset] = vecs[vd.idx]
+			orderedLabels[offset] = labels[vd.idx]
+			offset++
 		}
 		idx.clusters[c] = clusterBound{Start: startOffset, End: offset}
 	}
@@ -210,7 +275,7 @@ func (idx *Index) KNN(query [14]float32, k int) []bool {
 	}
 
 	// 1. Calculate distances to all centroids using the memoized table.
-	var cDists [256]centroidDist
+	var cDists [1024]centroidDist
 	for c := 0; c < len(idx.centroids); c++ {
 		v := idx.centroids[c]
 		d := distTable[0][uint8(v[0])] + distTable[1][uint8(v[1])] +

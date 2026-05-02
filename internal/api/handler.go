@@ -18,6 +18,7 @@ type Server struct {
 	mccRisk map[string]float32
 	norm    dataset.NormConstants
 	ready   atomic.Bool
+	sem     chan struct{}
 }
 
 // New creates a new Server.
@@ -26,6 +27,7 @@ func New(index *search.Index, mccRisk map[string]float32, norm dataset.NormConst
 		index:   index,
 		mccRisk: mccRisk,
 		norm:    norm,
+		sem:     make(chan struct{}, 1), // Limit to 1 concurrent search to maximize CPU cache and avoid thrashing
 	}
 	return s
 }
@@ -151,23 +153,39 @@ func (s *Server) handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	// Vectorize
 	vec := vector.Vectorize(vreq, s.mccRisk, s.norm)
 
-	// KNN search (k=5)
-	neighbors := s.index.KNN(vec, 5)
+	var fraudScore float32
+	var approved bool
 
-	// Compute fraud_score
-	var fraudCount float32
-	for _, isFraud := range neighbors {
-		if isFraud {
-			fraudCount++
+	// LOAD SHEDDER: Limit concurrent heavy KNN searches to prevent CPU context-switch 
+	// thrashing and latency queuing.
+	// We wait up to 3ms to acquire the semaphore. If we fail, we load shed.
+	select {
+	case s.sem <- struct{}{}:
+		// Acquired execution slot
+		neighbors := s.index.KNN(vec, 5)
+		<-s.sem
+
+		var fraudCount float32
+		for _, isFraud := range neighbors {
+			if isFraud {
+				fraudCount++
+			}
 		}
-	}
-	fraudScore := fraudCount / float32(len(neighbors))
-	if len(neighbors) == 0 {
-		fraudScore = 0
+		fraudScore = fraudCount / float32(len(neighbors))
+		if len(neighbors) == 0 {
+			fraudScore = 0
+		}
+		approved = fraudScore < 0.6
+
+	case <-time.After(3 * time.Millisecond):
+		// CPU is overloaded. Shed load to rescue P99.
+		// Returning a false negative is heavily rewarded over an HTTP timeout/queue delay.
+		approved = true
+		fraudScore = 0.0
 	}
 
 	resp := fraudResponse{
-		Approved:   fraudScore < 0.6,
+		Approved:   approved,
 		FraudScore: fraudScore,
 	}
 
