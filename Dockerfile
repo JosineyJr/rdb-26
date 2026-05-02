@@ -13,11 +13,11 @@ RUN go mod download
 # Copy source and build a statically linked binary
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-	go build -ldflags="-s -w" -o server .
+  GOEXPERIMENT=simd go build -ldflags="-s -w" -o server .
 
 # Pre-compute the 4096-cluster index using all host CPUs!
 # We then delete the JSON payload so the final container image stays extremely small.
-RUN go run cmd/build_index/main.go && rm resources/references.json.gz
+RUN GOEXPERIMENT=simd go run cmd/build_index/main.go && rm resources/references.json.gz
 
 # ──────────────────────────────────────────────────────────────
 # Runtime stage — minimal image
