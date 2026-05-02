@@ -9,8 +9,9 @@
 package search
 
 import (
+	"cmp"
 	"math/rand"
-	"runtime"
+	"slices"
 	"sync"
 
 	"github.com/JosineyJr/rdb-26/internal/dataset"
@@ -35,7 +36,7 @@ type clusterBound struct {
 // so that all vectors in a cluster are contiguous, maximizing CPU cache locality.
 func Build(vecs [][14]int8, labels []bool) *Index {
 	numClusters := 256
-	nprobe := 16 // scan top 16 clusters (6.25% of the dataset)
+	nprobe := 8 // scan top 8 clusters (3.1% of the dataset)
 
 	if len(vecs) < numClusters {
 		numClusters = len(vecs)
@@ -56,7 +57,8 @@ func Build(vecs [][14]int8, labels []bool) *Index {
 	}
 
 	// 2. Assign each vector to its nearest centroid.
-	workers := max(runtime.NumCPU(), 1)
+	// Force 1 worker to prevent catastrophic context-switching under the 0.45 CPU Docker limit.
+	workers := 1
 
 	type localClusters [][]int32
 	results := make([]localClusters, workers)
@@ -109,7 +111,7 @@ func Build(vecs [][14]int8, labels []bool) *Index {
 		}
 		idx.clusters[c] = clusterBound{start: startOffset, end: offset}
 	}
-	
+
 	idx.vecs = orderedVecs
 	idx.labels = orderedLabels
 
@@ -220,24 +222,19 @@ func (idx *Index) KNN(query [14]float32, k int) []bool {
 		cDists[c] = centroidDist{id: c, dist: d}
 	}
 
-	// 2. Selection sort to find the top `nprobe` centroids.
+	// 2. Sort the centroids to find the top `nprobe`.
+	// Since we have 256 centroids, Selection Sort is too slow. We use O(N log N) sorting.
+	slices.SortFunc(cDists[:], func(a, b centroidDist) int {
+		return cmp.Compare(a.dist, b.dist)
+	})
+
 	// We scan the closest 8 clusters (3% of the dataset).
 	nprobe := 8
-	numC := len(idx.centroids)
-	for i := range nprobe {
-		best := i
-		for j := i + 1; j < numC; j++ {
-			if cDists[j].dist < cDists[best].dist {
-				best = j
-			}
-		}
-		cDists[i], cDists[best] = cDists[best], cDists[i]
-	}
 
 	// 3. Scan the vectors in the selected clusters with EARLY ABANDON.
 	var t5 top5
 	maxDist := int32(0x7FFFFFFF) // Stays in a CPU register!
-	
+
 	for i := range nprobe {
 		c := cDists[i].id
 		bound := idx.clusters[c]
