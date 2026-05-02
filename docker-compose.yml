@@ -17,7 +17,7 @@ services:
           memory: "20MB"
 
   api1:
-    image: josiney/rdb-26-api:0f42cba
+    image: josiney/rdb-26-api:c66ff05
     environment:
       - PORT=8080
       # Cap Go's heap to 90% of the container limit so the GC acts before the
@@ -33,7 +33,7 @@ services:
           memory: "165MB"
 
   api2:
-    image: josiney/rdb-26-api:0f42cba
+    image: josiney/rdb-26-api:c66ff05
     environment:
       - PORT=8080
       - GOMEMLIMIT=145MiB
