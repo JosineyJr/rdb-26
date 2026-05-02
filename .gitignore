@@ -1,0 +1,19 @@
+# Binaries
+server
+*.exe
+
+# Build output
+/tmp/
+
+# Go module cache
+vendor/
+
+# IDE
+.idea/
+.vscode/
+
+# Docker
+.dockerignore
+
+# Resources are checked in intentionally (needed by Dockerfile)
+# resources/references.json.gz  ← this is ~48 MB, might want .gitlfsattributes
