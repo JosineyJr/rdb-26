@@ -1,0 +1,13 @@
+{
+    "participants": ["Josiney Junior"],
+    "social": [
+        "https://github.com/JosineyJr",
+        "https://www.linkedin.com/in/josineyjr/"
+    ],
+    "source-code-repo": "https://github.com/JosineyJr/rdb-26",
+    "stack": [
+        "go",
+        "nginx"
+    ],
+    "open_to_work": false
+}
