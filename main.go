@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"time"
 
 	"github.com/JosineyJr/rdb-26/internal/api"
@@ -30,8 +29,7 @@ func main() {
 		resourcesDir = "./resources"
 	}
 
-	refPath  := filepath.Join(resourcesDir, "references.json.gz")
-	mccPath  := filepath.Join(resourcesDir, "mcc_risk.json")
+	mccPath := filepath.Join(resourcesDir, "mcc_risk.json")
 	normPath := filepath.Join(resourcesDir, "normalization.json")
 
 	port := os.Getenv("PORT")
@@ -77,34 +75,21 @@ func main() {
 	}()
 
 	// ------------------------------------------------------------------
-	// Load reference vectors (the big file — 3M records)
 	// ------------------------------------------------------------------
-	log.Println("Loading reference vectors (this may take a while)...")
+	// Load Pre-computed Binary Index (Instantaneous)
+	// ------------------------------------------------------------------
+	log.Println("Loading pre-computed binary index from resources/index.bin...")
 	t0 := time.Now()
-	vecs, labels, err := dataset.LoadReferences(refPath)
+	index, err := search.Load("resources/index.bin")
 	if err != nil {
-		log.Fatalf("failed to load references: %v", err)
+		log.Fatalf("failed to load binary index: %v", err)
 	}
-	log.Printf("Loaded %d reference vectors in %v", len(vecs), time.Since(t0))
-
-	// ------------------------------------------------------------------
-	// Build KNN index (brute-force — instantaneous, no construction needed)
-	// ------------------------------------------------------------------
-	index := search.Build(vecs, labels)
+	log.Printf("Index loaded successfully in %v", time.Since(t0))
 
 	// ------------------------------------------------------------------
 	// Wire index into server and mark ready
 	// ------------------------------------------------------------------
 	srv.SetIndex(index)
-	
-	// CRITICAL: The main() function blocks forever on select{}.
-	// If we don't nil these variables, the original 45MB of startup data
-	// stays pinned in the stack frame forever, causing massive GC pressure
-	// when Nginx sends requests!
-	vecs = nil
-	labels = nil
-	runtime.GC()
-	debug.FreeOSMemory()
 
 	srv.SetReady()
 	log.Printf("Server ready on :%s — total startup time %v", port, time.Since(t0))

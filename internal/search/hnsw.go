@@ -9,9 +9,8 @@
 package search
 
 import (
-	"cmp"
 	"math/rand"
-	"slices"
+	"runtime"
 	"sync"
 
 	"github.com/JosineyJr/rdb-26/internal/dataset"
@@ -27,16 +26,16 @@ type Index struct {
 }
 
 type clusterBound struct {
-	start int32
-	end   int32
+	Start int32
+	End   int32
 }
 
 // Build constructs the IVF index by picking random centroids and assigning
 // each vector to the nearest centroid. It also reorganizes the vectors in memory
 // so that all vectors in a cluster are contiguous, maximizing CPU cache locality.
 func Build(vecs [][14]int8, labels []bool) *Index {
-	numClusters := 256
-	nprobe := 8 // scan top 8 clusters (3.1% of the dataset)
+	numClusters := 1024
+	nprobe := 16 // scan top 16 clusters (~1.5% of the dataset)
 
 	if len(vecs) < numClusters {
 		numClusters = len(vecs)
@@ -56,14 +55,15 @@ func Build(vecs [][14]int8, labels []bool) *Index {
 		idx.centroids[i] = vecs[perm[i]]
 	}
 
-	// 2. Assign each vector to its nearest centroid.
-	// Force 1 worker to prevent catastrophic context-switching under the 0.45 CPU Docker limit.
-	workers := 1
+	// 2. Assign each vector to its nearest centroid ONCE (Random Partitioning).
+	// This naturally scatters the vectors slightly, which massively benefits
+	// the Early Abandon CPU branch prediction during query time!
+	workers := max(runtime.NumCPU(), 1)
+	stripe := (len(vecs) + workers - 1) / workers
 
 	type localClusters [][]int32
 	results := make([]localClusters, workers)
 	var wg sync.WaitGroup
-	stripe := (len(vecs) + workers - 1) / workers
 
 	for w := range workers {
 		start := w * stripe
@@ -72,7 +72,9 @@ func Build(vecs [][14]int8, labels []bool) *Index {
 			continue
 		}
 
-		wg.Go(func() {
+		wg.Add(1)
+		go func(w, start, end int) {
+			defer wg.Done()
 			lc := make([][]int32, numClusters)
 			for i := start; i < end; i++ {
 				v := vecs[i]
@@ -89,7 +91,7 @@ func Build(vecs [][14]int8, labels []bool) *Index {
 				lc[bestC] = append(lc[bestC], int32(i))
 			}
 			results[w] = lc
-		})
+		}(w, start, end)
 	}
 	wg.Wait()
 
@@ -109,7 +111,7 @@ func Build(vecs [][14]int8, labels []bool) *Index {
 				}
 			}
 		}
-		idx.clusters[c] = clusterBound{start: startOffset, end: offset}
+		idx.clusters[c] = clusterBound{Start: startOffset, End: offset}
 	}
 
 	idx.vecs = orderedVecs
@@ -208,8 +210,13 @@ func (idx *Index) KNN(query [14]float32, k int) []bool {
 		dist int32
 	}
 
-	// 1. Calculate distances to all centroids using the memoized table.
-	var cDists [256]centroidDist
+	// 1. Calculate distances to all centroids and maintain top-16 directly
+	// This entirely bypasses slices.SortFunc, saving massive CPU cycles.
+	var top16 [16]centroidDist
+	for i := range 16 {
+		top16[i].dist = 0x7FFFFFFF
+	}
+
 	for c := 0; c < len(idx.centroids); c++ {
 		v := idx.centroids[c]
 		d := distTable[0][uint8(v[0])] + distTable[1][uint8(v[1])] +
@@ -219,47 +226,46 @@ func (idx *Index) KNN(query [14]float32, k int) []bool {
 			distTable[8][uint8(v[8])] + distTable[9][uint8(v[9])] +
 			distTable[10][uint8(v[10])] + distTable[11][uint8(v[11])] +
 			distTable[12][uint8(v[12])] + distTable[13][uint8(v[13])]
-		cDists[c] = centroidDist{id: c, dist: d}
+
+		if d < top16[15].dist {
+			insertIdx := 15
+			for insertIdx > 0 && d < top16[insertIdx-1].dist {
+				insertIdx--
+			}
+			for k := 15; k > insertIdx; k-- {
+				top16[k] = top16[k-1]
+			}
+			top16[insertIdx] = centroidDist{id: c, dist: d}
+		}
 	}
 
-	// 2. Sort the centroids to find the top `nprobe`.
-	// Since we have 256 centroids, Selection Sort is too slow. We use O(N log N) sorting.
-	slices.SortFunc(cDists[:], func(a, b centroidDist) int {
-		return cmp.Compare(a.dist, b.dist)
-	})
+	nprobe := 16
 
-	// We scan the closest 8 clusters (3% of the dataset).
-	nprobe := 8
-
-	// 3. Scan the vectors in the selected clusters with EARLY ABANDON.
+	// 3. Scan clusters logic
 	var t5 top5
 	maxDist := int32(0x7FFFFFFF) // Stays in a CPU register!
 
 	for i := range nprobe {
-		c := cDists[i].id
+		c := top16[i].id
 		bound := idx.clusters[c]
-
-		for j := bound.start; j < bound.end; j++ {
+		for j := bound.Start; j < bound.End; j++ {
 			v := idx.vecs[j]
 
 			// Unrolled with Early Abandon checks
 			d := distTable[0][uint8(v[0])] + distTable[1][uint8(v[1])] +
 				distTable[2][uint8(v[2])] + distTable[3][uint8(v[3])]
-
 			if d >= maxDist {
 				continue
 			}
 
 			d += distTable[4][uint8(v[4])] + distTable[5][uint8(v[5])] +
 				distTable[6][uint8(v[6])] + distTable[7][uint8(v[7])]
-
 			if d >= maxDist {
 				continue
 			}
 
 			d += distTable[8][uint8(v[8])] + distTable[9][uint8(v[9])] +
 				distTable[10][uint8(v[10])] + distTable[11][uint8(v[11])]
-
 			if d >= maxDist {
 				continue
 			}
