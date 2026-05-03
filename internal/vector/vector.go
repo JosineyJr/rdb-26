@@ -2,7 +2,6 @@
 package vector
 
 import (
-	"simd/archsimd"
 	"slices"
 	"time"
 
@@ -131,62 +130,4 @@ func Vectorize(req Request, mccRisk map[string]float32, norm dataset.NormConstan
 	v[13] = clamp(req.MerchantAvgAmt / norm.MaxMerchantAvgAmount)
 
 	return v
-}
-
-// DotProduct computes the dot product of two vectors using AVX-512 SIMD.
-func DotProduct(a, b []float32) float32 {
-	var sum float32
-	i := 0
-	length := len(a)
-
-	if length >= 16 {
-		var sum16 archsimd.Float32x16
-		loopEnd := length - length%16
-
-		for ; i < loopEnd; i += 16 {
-			va := archsimd.LoadFloat32x16Slice(a[i : i+16])
-			vb := archsimd.LoadFloat32x16Slice(b[i : i+16])
-			sum16 = sum16.Add(va.Mul(vb))
-		}
-
-		sum8 := sum16.GetLo().Add(sum16.GetHi())
-		sum4 := sum8.GetLo().Add(sum8.GetHi())
-		sum += sum4.GetElem(0) + sum4.GetElem(1) + sum4.GetElem(2) + sum4.GetElem(3)
-	}
-
-	for ; i < length; i++ {
-		sum += a[i] * b[i]
-	}
-
-	return sum
-}
-
-// L2DistanceSquared computes the squared Euclidean distance using AVX-512 SIMD.
-func L2DistanceSquared(a, b []float32) float32 {
-	var sum float32
-	i := 0
-	length := len(a)
-
-	if length >= 16 {
-		var sum16 archsimd.Float32x16
-		loopEnd := length - length%16
-
-		for ; i < loopEnd; i += 16 {
-			va := archsimd.LoadFloat32x16Slice(a[i : i+16])
-			vb := archsimd.LoadFloat32x16Slice(b[i : i+16])
-			diff := va.Sub(vb)
-			sum16 = sum16.Add(diff.Mul(diff))
-		}
-
-		sum8 := sum16.GetLo().Add(sum16.GetHi())
-		sum4 := sum8.GetLo().Add(sum8.GetHi())
-		sum += sum4.GetElem(0) + sum4.GetElem(1) + sum4.GetElem(2) + sum4.GetElem(3)
-	}
-
-	for ; i < length; i++ {
-		diff := a[i] - b[i]
-		sum += diff * diff
-	}
-
-	return sum
 }

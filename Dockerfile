@@ -13,11 +13,12 @@ RUN go mod download
 # Copy source and build a statically linked binary
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-  GOEXPERIMENT=simd go build -ldflags="-s -w" -o server .
+  go build -ldflags="-s -w" -o server .
 
-# Pre-compute the 4096-cluster index using all host CPUs!
-# We then delete the JSON payload so the final container image stays extremely small.
-RUN GOEXPERIMENT=simd go run cmd/build_index/main.go && rm resources/references.json.gz
+# Reuse the checked-in IVF index for normal builds; rebuild only if the artifact
+# is missing from the build context. The raw references are removed from the
+# builder so they cannot be copied into the runtime image by accident.
+RUN if [ ! -s resources/index.bin ]; then go run cmd/build_index/main.go; fi && rm -f resources/references.json.gz
 
 # ──────────────────────────────────────────────────────────────
 # Runtime stage — minimal image
@@ -30,7 +31,9 @@ COPY --from=builder /app/server .
 
 # Copy reference data files into the image so they're always available.
 # This avoids needing a shared volume and keeps the image self-contained.
-COPY --from=builder /app/resources/ ./resources/
+COPY --from=builder /app/resources/index.bin ./resources/index.bin
+COPY --from=builder /app/resources/mcc_risk.json ./resources/mcc_risk.json
+COPY --from=builder /app/resources/normalization.json ./resources/normalization.json
 
 ENV PORT=8080
 EXPOSE 8080

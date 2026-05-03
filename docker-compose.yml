@@ -25,7 +25,7 @@ services:
       # Cap Go's heap to 90% of the container limit so the GC acts before the
       # OOM killer does.  With int8 vectors we only use ~60 MB, so this is a
       # safety net, not a constraint.
-      - GOMEMLIMIT=145MiB
+      - GOMEMLIMIT=100MiB
     networks:
       - rinha
     deploy:
@@ -40,7 +40,7 @@ services:
       dockerfile: Dockerfile
     environment:
       - PORT=8080
-      - GOMEMLIMIT=145MiB
+      - GOMEMLIMIT=100MiB
     networks:
       - rinha
     deploy:

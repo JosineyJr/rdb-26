@@ -6,11 +6,55 @@ import (
 	"os"
 )
 
-// Magic header to ensure we're reading the right file.
-var magicHeader = []byte("RDB26IVF")
+// Magic headers to ensure we're reading the right file.
+var magicHeaderV1 = []byte("RDB26IVF")
+var magicHeaderV2 = []byte("RDB26IV2")
 
 // Save writes the built index to a raw binary file for instant loading.
 func (idx *Index) Save(path string) error {
+	return idx.saveCompact(path)
+}
+
+func (idx *Index) SaveWithMetadata(path string) error {
+	return idx.saveWithMetadata(path)
+}
+
+func (idx *Index) saveCompact(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if _, err := f.Write(magicHeaderV1); err != nil {
+		return err
+	}
+
+	numC := int32(len(idx.centroids))
+	numV := int32(len(idx.vecs))
+	nprobe := int32(idx.nprobe)
+
+	meta := []int32{numC, numV, nprobe}
+	if err := binary.Write(f, binary.LittleEndian, meta); err != nil {
+		return err
+	}
+	if err := binary.Write(f, binary.LittleEndian, idx.centroids); err != nil {
+		return err
+	}
+	if err := binary.Write(f, binary.LittleEndian, idx.clusters); err != nil {
+		return err
+	}
+	if err := binary.Write(f, binary.LittleEndian, idx.vecs); err != nil {
+		return err
+	}
+	if err := binary.Write(f, binary.LittleEndian, idx.labels); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (idx *Index) saveWithMetadata(path string) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -18,7 +62,7 @@ func (idx *Index) Save(path string) error {
 	defer f.Close()
 
 	// 1. Write Header
-	if _, err := f.Write(magicHeader); err != nil {
+	if _, err := f.Write(magicHeaderV2); err != nil {
 		return err
 	}
 
@@ -42,13 +86,26 @@ func (idx *Index) Save(path string) error {
 		return err
 	}
 
-	// 5. Write vecs
+	// 5. Write bounding boxes
+	if err := binary.Write(f, binary.LittleEndian, idx.bboxMin); err != nil {
+		return err
+	}
+	if err := binary.Write(f, binary.LittleEndian, idx.bboxMax); err != nil {
+		return err
+	}
+
+	// 6. Write vecs
 	if err := binary.Write(f, binary.LittleEndian, idx.vecs); err != nil {
 		return err
 	}
 
-	// 6. Write labels
+	// 7. Write labels
 	if err := binary.Write(f, binary.LittleEndian, idx.labels); err != nil {
+		return err
+	}
+
+	// 8. Write original reference ids
+	if err := binary.Write(f, binary.LittleEndian, idx.origIDs); err != nil {
 		return err
 	}
 
@@ -64,11 +121,12 @@ func Load(path string) (*Index, error) {
 	defer f.Close()
 
 	// 1. Read and verify header
-	header := make([]byte, len(magicHeader))
+	header := make([]byte, len(magicHeaderV1))
 	if _, err := f.Read(header); err != nil {
 		return nil, err
 	}
-	if string(header) != string(magicHeader) {
+	version := string(header)
+	if version != string(magicHeaderV1) && version != string(magicHeaderV2) {
 		return nil, fmt.Errorf("invalid magic header")
 	}
 
@@ -88,6 +146,11 @@ func Load(path string) (*Index, error) {
 		labels:    make([]bool, numV),
 		nprobe:    int(nprobe),
 	}
+	if version == string(magicHeaderV2) {
+		idx.bboxMin = make([][14]int8, numC)
+		idx.bboxMax = make([][14]int8, numC)
+		idx.origIDs = make([]uint32, numV)
+	}
 
 	// 3. Read centroids
 	if err := binary.Read(f, binary.LittleEndian, idx.centroids); err != nil {
@@ -99,14 +162,31 @@ func Load(path string) (*Index, error) {
 		return nil, err
 	}
 
-	// 5. Read vecs
+	if version == string(magicHeaderV2) {
+		// 5. Read bounding boxes
+		if err := binary.Read(f, binary.LittleEndian, idx.bboxMin); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(f, binary.LittleEndian, idx.bboxMax); err != nil {
+			return nil, err
+		}
+	}
+
+	// 6. Read vecs
 	if err := binary.Read(f, binary.LittleEndian, idx.vecs); err != nil {
 		return nil, err
 	}
 
-	// 6. Read labels
+	// 7. Read labels
 	if err := binary.Read(f, binary.LittleEndian, idx.labels); err != nil {
 		return nil, err
+	}
+
+	if version == string(magicHeaderV2) {
+		// 8. Read original reference ids
+		if err := binary.Read(f, binary.LittleEndian, idx.origIDs); err != nil {
+			return nil, err
+		}
 	}
 
 	return idx, nil

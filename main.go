@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/JosineyJr/rdb-26/internal/api"
@@ -56,20 +57,17 @@ func main() {
 	// Start HTTP server early so /ready can respond 503 during startup.
 	// ------------------------------------------------------------------
 	srv := api.New(nil, mccRisk, norm) // index not ready yet
-
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
-	httpServer := &http.Server{
-		Addr:         ":" + port,
-		Handler:      mux,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-	}
-
 	go func() {
 		log.Printf("HTTP server listening on :%s", port)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		httpServer := &http.Server{
+			Addr:              ":" + port,
+			Handler:           mux,
+			ReadHeaderTimeout: 2 * time.Second,
+		}
+		if err := httpServer.ListenAndServe(); err != nil {
 			log.Fatalf("http server error: %v", err)
 		}
 	}()
@@ -83,6 +81,12 @@ func main() {
 	index, err := search.Load("resources/index.bin")
 	if err != nil {
 		log.Fatalf("failed to load binary index: %v", err)
+	}
+	if repair, err := strconv.ParseBool(os.Getenv("IVF_REPAIR")); err == nil {
+		index.SetRepair(repair)
+	}
+	if nprobe, err := strconv.Atoi(os.Getenv("IVF_NPROBE")); err == nil {
+		index.SetNProbe(nprobe)
 	}
 	log.Printf("Index loaded successfully in %v", time.Since(t0))
 
